@@ -2,48 +2,49 @@ import CoreBluetooth
 import SwiftUI
 
 class BLEManager: NSObject, ObservableObject {
-    // MARK: - Published Properties
-    @Published var isScanning = false
-    @Published var isConnected = false
-    @Published var discoveredDevices: [CBPeripheral] = []
+    @Published private(set) var isScanning = false
+    @Published private(set) var isConnected = false
+    @Published private(set) var discoveredDevices: [CBPeripheral] = []
     
-    // MARK: - Private Properties
     private var centralManager: CBCentralManager!
     private var peripheral: CBPeripheral?
     private var authCharacteristic: CBCharacteristic?
     private var commandCharacteristic: CBCharacteristic?
     
-    // Target device address - from Python script
     private let targetDeviceAddress = "18:7A:3E:72:16:06"
     
-    // MARK: - Initialization
+    private let AUTH_HANDLE: UInt16 = 0x001d
+    private let CMD_HANDLE: UInt16 = 0x0020
+    
+    private var isReady = false
+    private let serviceUUID = CBUUID(string: "FF10")
+    private let authUUID = CBUUID(string: "FF12")
+    private let commandUUID = CBUUID(string: "FFF3")
+    
     override init() {
         super.init()
         centralManager = CBCentralManager(delegate: self, queue: nil)
     }
     
-    // MARK: - Public Methods
-    func startScanning() {
+    public func startScanning() {
         guard centralManager.state == .poweredOn else {
-            print("Bluetooth not powered on")
+            print("❌ Bluetooth is not powered on")
             return
         }
+        
         print("Starting scan...")
+        centralManager.scanForPeripherals(withServices: [serviceUUID], options: nil)
         isScanning = true
-        discoveredDevices.removeAll()
-        // Scan for all devices initially
-        centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
     }
     
-    func stopScanning() {
-        print("Stopping scan...")
-        isScanning = false
+    public func stopScanning() {
         centralManager.stopScan()
+        isScanning = false
     }
     
-    func connect(to peripheral: CBPeripheral) {
-        print("Attempting to connect to: \(peripheral)")
+    public func connect(to peripheral: CBPeripheral) {
         self.peripheral = peripheral
+        self.peripheral?.delegate = self
         centralManager.connect(peripheral, options: nil)
     }
     
@@ -52,60 +53,142 @@ class BLEManager: NSObject, ObservableObject {
             centralManager.cancelPeripheralConnection(peripheral)
         }
     }
-    
-    // MARK: - Private Methods
-    private func initializeDevice() {
-        guard let peripheral = peripheral,
-              let authChar = authCharacteristic,
-              let commandChar = commandCharacteristic else {
-            print("Missing required characteristics")
+
+    public func initializeDevice() {
+        guard let peripheral = peripheral else {
+            print("❌ No peripheral connected")
             return
         }
-        
+
         print("Starting device initialization sequence...")
         
-        // Auth command
         let authCommand = Data([0x01, 0x00])
-        peripheral.writeValue(authCommand, for: authChar, type: .withResponse)
-        print("Auth command sent")
+        print("📤 Sending auth command to handle 0x\(String(format: "%04x", AUTH_HANDLE))")
+        writeToHandle(peripheral, handle: AUTH_HANDLE, data: authCommand, withResponse: true)
         
-        // Wait for response before sending next command
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            // First command
             let cmd1 = Data(hexString: "7e3a0a0100c30d0a")
-            peripheral.writeValue(cmd1, for: commandChar, type: .withResponse)
-            print("First command sent")
+            print("📤 Sending command 1 to handle 0x\(String(format: "%04x", self.CMD_HANDLE))")
+            self.writeToHandle(peripheral, handle: self.CMD_HANDLE, data: cmd1, withResponse: true)
             
-            // Wait before sending start command
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                // Long start command - handle chunking
                 let cmd2 = Data(hexString: "7e3a072200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000282805100001470d0a")
-                self.writeLongCharacteristic(data: cmd2, characteristic: commandChar)
-                print("Start command sent")
+                print("📤 Sending command 2 to handle 0x\(String(format: "%04x", self.CMD_HANDLE))")
+                self.writeLongToHandle(peripheral, handle: self.CMD_HANDLE, data: cmd2)
                 
-                // Wait before sending final command
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     let cmd3 = Data(hexString: "7e3a060100bf0d0a")
-                    peripheral.writeValue(cmd3, for: commandChar, type: .withResponse)
-                    print("Final command sent")
+                    print("📤 Sending command 3 to handle 0x\(String(format: "%04x", self.CMD_HANDLE))")
+                    self.writeToHandle(peripheral, handle: self.CMD_HANDLE, data: cmd3, withResponse: true)
                 }
             }
         }
     }
     
-    private func writeLongCharacteristic(data: Data, characteristic: CBCharacteristic) {
+    private func writeToHandle(_ peripheral: CBPeripheral, handle: UInt16, data: Data, withResponse: Bool) {
+        let handleToUUID: [UInt16: String] = [
+            0x001d: "FF12",
+            0x0020: "FFF3"
+        ]
+        
+        guard let targetUUID = handleToUUID[handle] else {
+            print("❌ No UUID mapping for handle: 0x\(String(format: "%04x", handle))")
+            return
+        }
+        
+        for service in peripheral.services ?? [] {
+            for characteristic in service.characteristics ?? [] {
+                if characteristic.uuid.uuidString == targetUUID {
+                    peripheral.writeValue(data, for: characteristic, type: withResponse ? .withResponse : .withoutResponse)
+                    return
+                }
+            }
+        }
+        print("❌ No characteristic found for UUID: \(targetUUID)")
+    }
+    
+    private func writeLongToHandle(_ peripheral: CBPeripheral, handle: UInt16, data: Data) {
         let chunkSize = 18
         var offset = 0
         
-        while offset < data.count {
+        func writeNextChunk() {
+            guard offset < data.count else {
+                writeToHandle(peripheral, handle: handle, data: Data(), withResponse: true)
+                return
+            }
+            
             let end = min(offset + chunkSize, data.count)
             let chunk = data.subdata(in: offset..<end)
-            peripheral?.writeValue(chunk, for: characteristic, type: .withResponse)
-            offset += chunkSize
+            writeToHandle(peripheral, handle: handle, data: chunk, withResponse: true)
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                offset += chunkSize
+                writeNextChunk()
+            }
         }
         
-        // Send empty chunk to complete the write
-        peripheral?.writeValue(Data(), for: characteristic, type: .withResponse)
+        writeNextChunk()
+    }
+    
+    private func writeCharacteristic(_ characteristic: CBCharacteristic, value: Data) {
+        guard let peripheral = peripheral else {
+            print("❌ No connection")
+            return
+        }
+        
+        guard characteristic.properties.contains(.write) || 
+              characteristic.properties.contains(.writeWithoutResponse) else {
+            print("❌ Property not supported")
+            return
+        }
+        
+        let writeType: CBCharacteristicWriteType = 
+            characteristic.properties.contains(.write) ? .withResponse : .withoutResponse
+            
+        peripheral.writeValue(value, for: characteristic, type: writeType)
+    }
+    
+    private func writeLongCharacteristic(data: Data, handle: Int) {
+        let chunkSize = 18
+        var offset = 0
+        
+        func writeNextChunk() {
+            guard offset < data.count else {
+                peripheral?.writeValue(Data(), for: handle, type: .withResponse)
+                return
+            }
+            
+            let end = min(offset + chunkSize, data.count)
+            let chunk = data.subdata(in: offset..<end)
+            peripheral?.writeValue(chunk, for: handle, type: .withResponse)
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                offset += chunkSize
+                writeNextChunk()
+            }
+        }
+        
+        writeNextChunk()
+    }
+    
+    private func startInitialization() {
+        guard let peripheral = peripheral,
+              let authChar = authCharacteristic else {
+            print("❌ Missing peripheral or auth characteristic")
+            return
+        }
+        
+        print("Starting device initialization sequence...")
+        let authCommand = Data([0x01, 0x00])
+        print("📤 Sending auth command: \(authCommand.hexEncodedString())")
+        
+        if authChar.properties.contains(.write) {
+            peripheral.writeValue(authCommand, for: authChar, type: .withResponse)
+        } else if authChar.properties.contains(.writeWithoutResponse) {
+            peripheral.writeValue(authCommand, for: authChar, type: .withoutResponse)
+        } else {
+            print("❌ Auth characteristic doesn't support writing")
+        }
     }
 }
 
@@ -113,40 +196,37 @@ class BLEManager: NSObject, ObservableObject {
 extension BLEManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
-        case .poweredOn:
-            print("Bluetooth is powered on")
-            startScanning() // Auto-start scanning when Bluetooth is ready
-        case .poweredOff:
-            print("Bluetooth is powered off")
-            isConnected = false
-        case .resetting:
-            print("Bluetooth is resetting")
-        case .unauthorized:
-            print("Bluetooth is unauthorized")
-        case .unsupported:
-            print("Bluetooth is unsupported")
-        case .unknown:
-            print("Bluetooth state is unknown")
-        @unknown default:
-            print("Unknown Bluetooth state")
+            case .poweredOn:
+                print("Bluetooth is powered on")
+            case .poweredOff:
+                print("Bluetooth is powered off")
+            case .unsupported:
+                print("Bluetooth is unsupported")
+            case .unauthorized:
+                print("Bluetooth is unauthorized")
+            case .resetting:
+                print("Bluetooth is resetting")
+            case .unknown:
+                print("Bluetooth state is unknown")
+            @unknown default:
+                print("Unknown Bluetooth state")
         }
     }
     
-    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
-        print("Discovered device: \(peripheral.identifier.uuidString) - \(peripheral.name ?? "Unknown")")
-        
-        // Check if this is our target device
-        // Note: iOS doesn't provide MAC address directly, so we'll check the identifier
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        print("🔍 Discovered Device: \(peripheral.identifier.uuidString) - \(peripheral.name ?? "Unknown")")
+
         if !discoveredDevices.contains(where: { $0.identifier == peripheral.identifier }) {
             discoveredDevices.append(peripheral)
         }
     }
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        print("Connected to peripheral")
+        print("✅ Connected to: \(peripheral.identifier.uuidString)")
         isConnected = true
-        peripheral.delegate = self
-        peripheral.discoverServices(nil)
+        self.peripheral = peripheral
+        self.peripheral?.delegate = self
+        self.peripheral?.discoverServices(nil)
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
@@ -159,45 +239,75 @@ extension BLEManager: CBCentralManagerDelegate {
 
 // MARK: - CBPeripheralDelegate
 extension BLEManager: CBPeripheralDelegate {
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let services = peripheral.services else { return }
-        print("Discovered services: \(services)")
+    public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard error == nil else {
+            print("❌ Error discovering services: \(error!.localizedDescription)")
+            return
+        }
+        
+        guard let services = peripheral.services else {
+            print("❌ No services found")
+            return
+        }
         
         for service in services {
-            peripheral.discoverCharacteristics(nil, for: service)
+            if service.uuid == serviceUUID {
+                print("✅ Found service: \(service.uuid)")
+                peripheral.discoverCharacteristics([authUUID, commandUUID], for: service)
+            }
         }
     }
 
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard let characteristics = service.characteristics else { return }
-        print("Discovered characteristics for service \(service.uuid): \(characteristics)")
+    public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        guard error == nil else {
+            print("❌ Error discovering characteristics: \(error!.localizedDescription)")
+            return
+        }
+        
+        guard let characteristics = service.characteristics else {
+            print("❌ No characteristics found")
+            return
+        }
         
         for characteristic in characteristics {
-            // Look for characteristics by UUID
-            if characteristic.properties.contains(.write) || characteristic.properties.contains(.writeWithoutResponse) {
-                // Using UUIDs instead of handles
-                // Note: Replace these UUIDs with the actual UUIDs from your device
-                if characteristic.uuid.uuidString == "FF01" {  // Auth characteristic UUID
-                    authCharacteristic = characteristic
-                    print("Found auth characteristic")
-                } else if characteristic.uuid.uuidString == "FF02" {  // Command characteristic UUID
-                    commandCharacteristic = characteristic
-                    print("Found command characteristic")
-                }
+            if characteristic.uuid == authUUID {
+                print("✅ Auth characteristic found: \(characteristic.uuid)")
+                authCharacteristic = characteristic
+                peripheral.setNotifyValue(true, for: characteristic)
+            }
+            if characteristic.uuid == commandUUID {
+                print("✅ Command characteristic found: \(characteristic.uuid)")
+                commandCharacteristic = characteristic
             }
         }
         
-        // If we found both characteristics, start the initialization
         if authCharacteristic != nil && commandCharacteristic != nil {
-            initializeDevice()
+            print("✅ Found both required characteristics, starting initialization...")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.startInitialization()
+            }
         }
     }
-    
+
+    public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard error == nil else {
+            print("❌ Error receiving notification: \(error!.localizedDescription)")
+            return
+        }
+        
+        if characteristic.uuid == authUUID {
+            if let value = characteristic.value {
+                print("✅ Received value from \(characteristic.uuid): \(value.hexEncodedString())")
+                isReady = true
+            }
+        }
+    }
+
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
-            print("Error writing characteristic: \(error.localizedDescription)")
+            print("❌ Error writing characteristic: \(error.localizedDescription)")
         } else {
-            print("Successfully wrote characteristic")
+            print("✅ Successfully wrote to \(characteristic.uuid.uuidString)")
         }
     }
 }
@@ -215,5 +325,26 @@ extension Data {
             Scanner(string: c).scanHexInt32(&ch)
             self.append(UInt8(ch))
         }
+    }
+
+    func hexEncodedString() -> String {
+        return map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+// Add extension to CBPeripheral to support writing by handle
+extension CBPeripheral {
+    private static var handleToCharacteristic: [Int: CBCharacteristic] = [:]
+    
+    func writeValue(_ data: Data, for handle: Int, type: CBCharacteristicWriteType) {
+        if let characteristic = CBPeripheral.handleToCharacteristic[handle] {
+            writeValue(data, for: characteristic, type: type)
+        } else {
+            print("❌ No characteristic found for handle: 0x\(String(format: "%04x", handle))")
+        }
+    }
+    
+    static func storeCharacteristic(_ characteristic: CBCharacteristic, for handle: Int) {
+        handleToCharacteristic[handle] = characteristic
     }
 }
